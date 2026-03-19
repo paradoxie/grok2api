@@ -13,6 +13,8 @@ DEFAULT_API_KEY = ""
 DEFAULT_APP_KEY = "grok2api"
 DEFAULT_FUNCTION_KEY = ""
 DEFAULT_FUNCTION_ENABLED = False
+DEFAULT_PUBLIC_KEY = ""
+DEFAULT_PUBLIC_ENABLED = False
 
 # 定义 Bearer Scheme
 security = HTTPBearer(
@@ -74,6 +76,23 @@ def is_function_enabled() -> bool:
     是否开启功能玩法入口。
     """
     return bool(get_config("app.function_enabled", DEFAULT_FUNCTION_ENABLED))
+
+
+def get_public_api_key() -> str:
+    """
+    获取 Public API Key。
+
+    为空时表示不启用 public 接口认证。
+    """
+    public_key = get_config("app.public_key", DEFAULT_PUBLIC_KEY)
+    return public_key or ""
+
+
+def is_public_enabled() -> bool:
+    """
+    是否开启 public 功能入口。
+    """
+    return bool(get_config("app.public_enabled", DEFAULT_PUBLIC_ENABLED))
 
 
 def _match_function_key(credentials: str, function_key: str) -> bool:
@@ -182,6 +201,44 @@ async def verify_function_key(
         )
 
     if _match_function_key(auth.credentials, function_key):
+        return auth.credentials
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def verify_public_key(
+    auth: Optional[HTTPAuthorizationCredentials] = Security(security),
+) -> Optional[str]:
+    """
+    验证 Public Key（public 页面接口使用）。
+
+    默认不公开，需配置 public_key 才能访问；
+    若开启 public_enabled 且未配置 public_key，则放开访问。
+    """
+    public_key = get_public_api_key()
+    public_enabled = is_public_enabled()
+
+    if not public_key:
+        if public_enabled:
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Public access is disabled",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not auth:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if hmac.compare_digest(auth.credentials, public_key.strip()):
         return auth.credentials
 
     raise HTTPException(

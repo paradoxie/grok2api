@@ -41,6 +41,10 @@ from app.api.v1.response import router as responses_router  # noqa: E402
 from app.services.token import get_scheduler  # noqa: E402
 from app.api.v1.admin import router as admin_router
 from app.api.v1.function import router as function_router
+from app.api.v1.nsfw import router as nsfw_router
+from app.api.v1.video import router as video_router
+from app.api.v1.video_api import router as video_api_router
+from app.api.v1.public_api import router as public_router
 from app.api.pages import router as pages_router
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -162,9 +166,24 @@ def create_app() -> FastAPI:
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+    # 静态文件服务（public 工作台 app/static）
+    app_static_dir = BASE_DIR / "app" / "static"
+    if app_static_dir.exists():
+        app.mount("/app-static", StaticFiles(directory=app_static_dir), name="app-static")
+
     # 注册管理与功能玩法路由
     app.include_router(admin_router, prefix="/v1/admin")
     app.include_router(function_router, prefix="/v1/function")
+
+    # 注册 public 工作台路由
+    app.include_router(public_router, prefix="/v1/public")
+    app.include_router(
+        nsfw_router, prefix="/v1", dependencies=[Depends(verify_api_key)]
+    )
+    app.include_router(
+        video_api_router, prefix="/v1", dependencies=[Depends(verify_api_key)]
+    )
+
     app.include_router(pages_router)
 
     @app.get("/favicon.ico", include_in_schema=False)

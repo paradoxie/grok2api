@@ -10,6 +10,10 @@ api_key = ""
 function_enabled = false
 # function 调用密钥（可选）
 function_key = ""
+# 是否启用 public 功能页面
+public_enabled = false
+# Public 调用密钥（可选）
+public_key = ""
 # 生成图片的格式（url 或 base64）
 image_format = "url"
 # 生成视频的格式（html 或 url）
@@ -104,8 +108,12 @@ limit_mb = 512
 [chat]
 # Reverse 接口并发上限
 concurrent = 50
+# 连接超时时间（秒），用于弱网快速失败
+connect_timeout = 12
 # Reverse 接口超时时间（秒）
 timeout = 60
+# 首包超时时间（秒），连接成功后迟迟无返回则快速超时
+first_token_timeout = 20
 # 流式空闲超时时间（秒）
 stream_timeout = 60
 
@@ -161,6 +169,14 @@ upscale_timing = "complete"
 [voice]
 # Voice 请求超时时间（秒）
 timeout = 60
+# LiveKit 信令地址（可选，优先于上游返回）
+livekit_url = ""
+# LiveKit 信令地址候选列表（可选，支持多地址回退）
+livekit_urls = []
+# 是否启用同域 signal 代理（用于移动端兜底）
+signal_proxy_enabled = true
+# signal 代理地址（可选，留空则按当前域名自动生成）
+signal_proxy_url = ""
 
 # ==================== 资产配置 ====================
 [asset]
