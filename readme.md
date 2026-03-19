@@ -472,6 +472,69 @@ curl http://localhost:8000/v1/videos \
 
 <br>
 
+## 公共工作台 (Public Workbench)
+
+> 集成自 [XianYuDaXian/grok2api](https://github.com/XianYuDaXian/grok2api) 的前端工作台能力
+
+设置环境变量启用：
+
+```bash
+PUBLIC_ENABLED=true
+PUBLIC_KEY=你的密码    # 留空则免密访问
+```
+
+访问 `http://<host>:<port>/login` 进入公共工作台。
+
+| 页面 | 路由 | 说明 |
+| :-- | :-- | :-- |
+| 登录 | `/login` | Public Key 认证入口 |
+| Imagine 瀑布流 | `/imagine` | WebSocket 持续生图，实时 base64 瀑布流 |
+| 图片编辑工作台 | `/imagine-workbench` | 多图参考 + parentPostId 链路编辑 |
+| Video 视频工作台 | `/video` | 生成 + 延长拼接至 30 秒 + 多图参考 |
+| Chat 聊天 | `/chat` | 多模型选择、会话管理 |
+| NSFW 工作台 | `/nsfw` | 候选图生成→选图→并行视频 |
+| LiveKit 语音 | `/voice` | LiveKit 语音实时陪聊 |
+
+**附加功能**：🌙 夜间模式、PWA 离线安装、提示词增强、parentPostId 全局记忆
+
+**附加配置项**：
+
+| 模块 | 字段 | 说明 | 默认值 |
+| :-- | :-- | :-- | :-- |
+| **app** | `public_enabled` | 是否启用公共工作台 | `false` |
+|  | `public_key` | 公共工作台登录密钥 | `""` |
+| **chat** | `connect_timeout` | 连接超时（秒），弱网快速失败 | `12` |
+|  | `first_token_timeout` | 首包超时（秒） | `20` |
+| **voice** | `livekit_url` | LiveKit 信令地址 | `""` |
+|  | `signal_proxy_enabled` | 启用同域 signal 代理 | `true` |
+
+<br>
+
+## 关于本项目
+
+本项目 fork 自 [chenyme/grok2api](https://github.com/chenyme/grok2api)，在保留上游全部 API 能力的基础上，集成了 [XianYuDaXian/grok2api](https://github.com/XianYuDaXian/grok2api) 的前端工作台增强。
+
+### 源码追踪
+
+| 仓库 | 用途 | 同步基准 |
+| :-- | :-- | :-- |
+| [chenyme/grok2api](https://github.com/chenyme/grok2api) (upstream) | 上游主线，API 核心 | 持续同步 `upstream/main` |
+| [XianYuDaXian/grok2api](https://github.com/XianYuDaXian/grok2api) (fork) | 前端工作台能力来源 | 已集成至 `7f4b1dc` (2026-03-18) |
+
+> **下次同步 XianYuDaXian 新增内容时**，从 commit `7f4b1dc` 之后开始排查：
+> ```bash
+> git log fork/main --oneline --since="2026-03-18"
+> git diff 7f4b1dc fork/main --stat
+> ```
+
+### 致谢
+
+- [chenyme](https://github.com/chenyme) — Grok2API 原作者，全部后端 API 基础设施
+- [XianYuDaXian](https://github.com/XianYuDaXian) — 前端工作台（Imagine/Video/NSFW/Voice/PWA/夜间模式）
+
+<br>
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Chenyme/grok2api&type=Timeline)](https://star-history.com/#Chenyme/grok2api&Timeline)
+
