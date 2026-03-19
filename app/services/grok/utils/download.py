@@ -8,18 +8,21 @@ import asyncio
 import base64
 import hashlib
 import os
+import time
+import urllib.request
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiofiles
+from curl_cffi.requests import AsyncSession
 
 from app.core.logger import logger
 from app.core.storage import DATA_DIR
 from app.core.config import get_config
 from app.core.exceptions import AppException
 from app.services.reverse.assets_download import AssetsDownloadReverse
-from app.services.reverse.utils.session import ResettableSession
+from app.services.reverse.utils.headers import build_headers
 from app.services.grok.utils.locks import _get_download_semaphore, _file_lock
 
 
@@ -27,7 +30,7 @@ class DownloadService:
     """Assets download service."""
 
     def __init__(self):
-        self._session: Optional[ResettableSession] = None
+        self._session: Optional[AsyncSession] = None
         base_dir = DATA_DIR / "tmp"
         self.image_dir = base_dir / "image"
         self.video_dir = base_dir / "video"
@@ -35,14 +38,10 @@ class DownloadService:
         self.video_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_running = False
 
-    async def create(self) -> ResettableSession:
+    async def create(self) -> AsyncSession:
         """Create or reuse a session."""
         if self._session is None:
-            browser = get_config("proxy.browser")
-            if browser:
-                self._session = ResettableSession(impersonate=browser)
-            else:
-                self._session = ResettableSession()
+            self._session = AsyncSession()
         return self._session
 
     async def close(self):
@@ -54,9 +53,16 @@ class DownloadService:
     async def resolve_url(
         self, path_or_url: str, token: str, media_type: str = "image"
     ) -> str:
+        if self._is_public_share_url(path_or_url):
+            app_url = get_config("app.app_url")
+            filename = self._public_cache_filename(path_or_url, media_type)
+            if app_url:
+                await self.download_file(path_or_url, token, media_type)
+                return f"{app_url.rstrip('/')}/v1/files/{media_type}/{filename}"
+            return path_or_url
+
         asset_url = path_or_url
         path = path_or_url
-        parsed = None
         if path_or_url.startswith("http"):
             parsed = urlparse(path_or_url)
             path = parsed.path or ""
@@ -69,11 +75,123 @@ class DownloadService:
 
         app_url = get_config("app.app_url")
         if app_url:
-            if parsed and parsed.netloc and parsed.netloc != "assets.grok.com":
-                return asset_url
             await self.download_file(asset_url, token, media_type)
             return f"{app_url.rstrip('/')}/v1/files/{media_type}{path}"
         return asset_url
+
+    @staticmethod
+    def _is_public_share_url(url: str) -> bool:
+        text = str(url or "").strip().lower()
+        return (
+            text.startswith("https://imagine-public.x.ai/")
+            or text.startswith("http://imagine-public.x.ai/")
+        )
+
+    @staticmethod
+    def _is_localhost_url(url: str) -> bool:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower()
+        return host in {"localhost", "127.0.0.1", "::1"}
+
+    @staticmethod
+    def _public_cache_filename(file_url: str, media_type: str = "image") -> str:
+        parsed = urlparse(str(file_url or "").strip())
+        suffix = Path(parsed.path or "").suffix
+        filename = (
+            (parsed.netloc + (parsed.path or ""))
+            .lstrip("/")
+            .replace("/", "-")
+            .replace(":", "-")
+        )
+        if not filename:
+            filename = f"public-{media_type}"
+        if suffix and not filename.endswith(suffix):
+            filename = f"{filename}{suffix}"
+        return filename
+
+    async def _download_public_url(
+        self,
+        file_url: str,
+        media_type: str = "image",
+    ) -> Tuple[Optional[Path], str]:
+        """下载公开分享直链，避免误走 assets.grok.com 反代。"""
+        started_at = time.perf_counter()
+        cache_dir = self.image_dir if media_type == "image" else self.video_dir
+        filename = self._public_cache_filename(file_url, media_type)
+        cache_path = cache_dir / filename
+        logger.info(
+            f"Public download started: media_type={media_type}, file_url={file_url}, cache_path={cache_path}"
+        )
+
+        lock_name = (
+            f"dl_public_{media_type}_{hashlib.sha1(str(cache_path).encode()).hexdigest()[:16]}"
+        )
+        lock_timeout = max(1, int(get_config("asset.download_timeout")))
+        async with _file_lock(lock_name, timeout=lock_timeout):
+            base_proxy = (get_config("proxy.base_proxy_url") or "").strip()
+            asset_proxy = (get_config("proxy.asset_proxy_url") or "").strip()
+            proxy_url = asset_proxy or base_proxy
+            headers = build_headers(
+                cookie_token="",
+                content_type="video/mp4" if media_type == "video" else "image/jpeg",
+                origin="https://grok.com",
+                referer="https://grok.com/",
+            )
+            if media_type == "video":
+                headers["Range"] = "bytes=0-"
+
+            def _urllib_download():
+                opener = (
+                    urllib.request.build_opener(
+                        urllib.request.ProxyHandler(
+                            {"http": proxy_url, "https": proxy_url}
+                        )
+                    )
+                    if proxy_url
+                    else urllib.request.build_opener()
+                )
+                req = urllib.request.Request(file_url, headers=headers, method="GET")
+                with opener.open(req, timeout=get_config("asset.download_timeout")) as resp:
+                    status = int(getattr(resp, "status", 200) or 200)
+                    body = resp.read()
+                    raw_headers = {str(k).lower(): str(v) for k, v in dict(resp.headers.items()).items()}
+                    return status, raw_headers, body
+
+            status_code, response_headers, response_body = await asyncio.to_thread(
+                _urllib_download
+            )
+            if status_code not in (200, 206):
+                raise AppException(
+                    f"Public download failed, status={status_code}",
+                    code="public_download_failed",
+                )
+            logger.info(
+                f"Public download response received: media_type={media_type}, file_url={file_url}, "
+                f"status={status_code}, content_type={(response_headers.get('content-type', 'application/octet-stream').split(';')[0])}"
+            )
+
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            try:
+                async with aiofiles.open(tmp_path, "wb") as f:
+                    await f.write(response_body)
+                os.replace(tmp_path, cache_path)
+            finally:
+                if tmp_path.exists() and not cache_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+
+            mime = response_headers.get(
+                "content-type", "application/octet-stream"
+            ).split(";")[0]
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            logger.info(
+                f"Public downloaded: {file_url}, media_type={media_type}, cache_path={cache_path}, "
+                f"mime={mime}, duration_ms={duration_ms:.2f}"
+            )
+            asyncio.create_task(self._check_limit())
+            return cache_path, mime
 
     async def render_image(
         self, url: str, token: str, image_id: str = "image"
@@ -100,12 +218,30 @@ class DownloadService:
         fmt = fmt.lower() if isinstance(fmt, str) else "url"
         if fmt not in ("url", "markdown", "html"):
             fmt = "url"
+        started_at = time.perf_counter()
+        logger.info(
+            f"Render video started: video_url={video_url}, thumbnail_url={thumbnail_url or '-'}, format={fmt}"
+        )
+        if self._is_public_share_url(video_url) and thumbnail_url:
+            logger.info(
+                f"Render video skip thumbnail for public share video: video_url={video_url}, thumbnail_url={thumbnail_url}"
+            )
+            thumbnail_url = ""
         final_video_url = await self.resolve_url(video_url, token, "video")
         final_thumb_url = ""
         if thumbnail_url:
-            final_thumb_url = await self.resolve_url(thumbnail_url, token, "image")
+            try:
+                final_thumb_url = await self.resolve_url(thumbnail_url, token, "image")
+            except Exception as e:
+                logger.warning(f"Render video thumbnail resolve failed, ignore thumbnail: {e}")
+                final_thumb_url = ""
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            f"Render video resolved: final_video_url={final_video_url}, "
+            f"final_thumbnail_url={final_thumb_url or '-'}, duration_ms={duration_ms:.2f}"
+        )
         if fmt == "url":
-            return f"{final_video_url}\n"
+            return final_video_url
         if fmt == "markdown":
             return f"[video]({final_video_url})"
         import html
@@ -117,6 +253,17 @@ class DownloadService:
   <source id="mp4" src="{safe_video_url}" type="video/mp4">
 </video>'''
 
+    @staticmethod
+    def _is_url(value: str) -> bool:
+        """Check if the value is a URL."""
+        try:
+            parsed = urlparse(value)
+            return bool(
+                parsed.scheme and parsed.netloc and parsed.scheme in ["http", "https"]
+            )
+        except Exception:
+            return False
+
     async def parse_b64(self, file_path: str, token: str, media_type: str = "image") -> str:
         """Download and return data URI."""
         try:
@@ -124,6 +271,9 @@ class DownloadService:
                 raise AppException("Invalid file path", code="invalid_file_path")
             if file_path.startswith("data:"):
                 raise AppException("Invalid file path", code="invalid_file_path")
+            if not self._is_url(file_path):
+                raise AppException("Invalid file path", code="invalid_file_path")
+
             file_path = self._normalize_path(file_path)
             lock_name = f"dl_b64_{hashlib.sha1(file_path.encode()).hexdigest()[:16]}"
             lock_timeout = max(1, int(get_config("asset.download_timeout")))
@@ -154,32 +304,19 @@ class DownloadService:
             raise
 
     def _normalize_path(self, file_path: str) -> str:
-        """Normalize URL or path to assets path for download."""
+        """Normalize file path for download."""
         if not isinstance(file_path, str) or not file_path.strip():
             raise AppException("Invalid file path", code="invalid_file_path")
-
-        value = file_path.strip()
-        if value.startswith("data:"):
+        parsed = urlparse(file_path)
+        if not (parsed.scheme and parsed.netloc and parsed.scheme in ["http", "https"]):
             raise AppException("Invalid file path", code="invalid_file_path")
-
-        parsed = urlparse(value)
-        if parsed.scheme or parsed.netloc:
-            if not (
-                parsed.scheme and parsed.netloc and parsed.scheme in ["http", "https"]
-            ):
-                raise AppException("Invalid file path", code="invalid_file_path")
-            path = parsed.path or ""
-            if parsed.query:
-                path = f"{path}?{parsed.query}"
-        else:
-            path = value
-
-        if not path:
-            raise AppException("Invalid file path", code="invalid_file_path")
-        if not path.startswith("/"):
-            path = f"/{path}"
-
-        return path
+        path = parsed.path or ""
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        file_path = path
+        if not file_path.startswith("/"):
+            file_path = f"/{file_path}"
+        return file_path
 
     async def download_file(self, file_path: str, token: str, media_type: str = "image") -> Tuple[Optional[Path], str]:
         """Download asset to local cache.
@@ -192,12 +329,18 @@ class DownloadService:
         Returns:
             Tuple[Optional[Path], str]: The path of the downloaded file and the MIME type.
         """
+        if self._is_public_share_url(file_path):
+            return await self._download_public_url(file_path, media_type)
+
+        started_at = time.perf_counter()
         async with _get_download_semaphore():
             file_path = self._normalize_path(file_path)
             cache_dir = self.image_dir if media_type == "image" else self.video_dir
-            cache_key = urlparse(file_path).path or file_path
-            filename = cache_key.lstrip("/").replace("/", "-")
+            filename = file_path.lstrip("/").replace("/", "-")
             cache_path = cache_dir / filename
+            logger.info(
+                f"Download started: media_type={media_type}, file_path={file_path}, cache_path={cache_path}"
+            )
 
             lock_name = (
                 f"dl_{media_type}_{hashlib.sha1(str(cache_path).encode()).hexdigest()[:16]}"
@@ -206,6 +349,11 @@ class DownloadService:
             async with _file_lock(lock_name, timeout=lock_timeout):
                 session = await self.create()
                 response = await AssetsDownloadReverse.request(session, token, file_path)
+                logger.info(
+                    f"Download response received: media_type={media_type}, file_path={file_path}, "
+                    f"status={getattr(response, 'status_code', '-')}, "
+                    f"content_type={(response.headers.get('content-type', 'application/octet-stream').split(';')[0])}"
+                )
 
                 tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
                 try:
@@ -227,7 +375,16 @@ class DownloadService:
                 mime = response.headers.get(
                     "content-type", "application/octet-stream"
                 ).split(";")[0]
-                logger.info(f"Downloaded: {file_path}")
+                file_size = 0
+                try:
+                    file_size = cache_path.stat().st_size
+                except Exception:
+                    file_size = 0
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                logger.info(
+                    f"Downloaded: {file_path}, media_type={media_type}, cache_path={cache_path}, "
+                    f"size_bytes={file_size}, mime={mime}, duration_ms={duration_ms:.2f}"
+                )
 
                 asyncio.create_task(self._check_limit())
 
